@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Pictorial Wallpaper Sync</string>
+    <string name="app_desc">Sync HeyTap Pictorial lock screen image to home wallpaper.</string>
+</resources>
+
