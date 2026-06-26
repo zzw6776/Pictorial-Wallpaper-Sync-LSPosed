@@ -8,10 +8,12 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -27,7 +29,6 @@ public final class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "PictorialWallpaperSync";
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final AtomicBoolean pollerStarted = new AtomicBoolean(false);
     private final AtomicReference<String> lastSynced = new AtomicReference<>("");
     private final AtomicReference<Context> appContext = new AtomicReference<>();
 
@@ -42,6 +43,7 @@ public final class MainHook implements IXposedHookLoadPackage {
         hookSettingsSystemPutString(lpparam.classLoader);
         hookContentResolverCall(lpparam.classLoader);
         hookContentResolverUpdate(lpparam.classLoader);
+        hookKeyguardHelper(lpparam.classLoader);
     }
 
     private void hookApplicationAttach(ClassLoader classLoader) {
@@ -60,12 +62,13 @@ public final class MainHook implements IXposedHookLoadPackage {
                             }
                             Context applicationContext = context.getApplicationContext();
                             appContext.set(applicationContext != null ? applicationContext : context);
+                            
+                            // 初始化时进行一次同步
                             String value = Settings.System.getString(
                                     context.getContentResolver(),
                                     CURRENT_URI_KEY
                             );
                             syncAsync(context.getContentResolver(), value, "Application.attach");
-                            startPolling(context.getContentResolver());
                         }
                     }
             );
@@ -152,53 +155,64 @@ public final class MainHook implements IXposedHookLoadPackage {
         if (resolver == null || value == null) {
             return;
         }
-        if (!CURRENT_URI_KEY.equals(key) && !value.startsWith(PICTORIAL_URI_PREFIX)) {
+        if (key != null && !CURRENT_URI_KEY.equals(key)) {
+            return;
+        }
+        if (!value.startsWith(PICTORIAL_URI_PREFIX)) {
             return;
         }
         syncAsync(resolver, value, source);
     }
 
-    private void startPolling(final ContentResolver resolver) {
-        if (resolver == null || !pollerStarted.compareAndSet(false, true)) {
-            return;
-        }
-
-        Thread thread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                while (true) {
-                    try {
-                        String value = Settings.System.getString(resolver, CURRENT_URI_KEY);
-                        syncAsync(resolver, value, "poll");
-                        Thread.sleep(30000L);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    } catch (Throwable t) {
-                        log(t);
-                        try {
-                            Thread.sleep(30000L);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
+    private void hookKeyguardHelper(ClassLoader classLoader) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.heytap.pictorial.keyguard.KeyguardHelper",
+                    classLoader,
+                    "a",
+                    "com.nearme.themespace.shared.pictorial.LocalImageInfo3",
+                    int.class,
+                    long.class,
+                    String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            // 当图片切换展示时被调用，异步延迟读取 Settings 以达到实时同步
+                            executor.execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        // 延迟 200ms 等待乐划锁屏将新图片 URI 写入 Settings 数据库
+                                        Thread.sleep(200L);
+                                        
+                                        Context context = appContext.get();
+                                        ContentResolver resolver = context != null ? context.getContentResolver() : null;
+                                        if (resolver != null) {
+                                            String value = Settings.System.getString(resolver, CURRENT_URI_KEY);
+                                            log("KeyguardHelper.a -> read Settings: " + value);
+                                            if (value != null) {
+                                                syncAsync(resolver, value, "KeyguardHelper.a (delayed)");
+                                            }
+                                        }
+                                    } catch (Throwable t) {
+                                        log(t);
+                                    }
+                                }
+                            });
                         }
                     }
-                }
-            }
-        }, "pictorial-wallpaper-sync");
-        thread.setDaemon(true);
-        thread.start();
-        log("started poller interval=30000ms");
+            );
+            log("hooked KeyguardHelper.a successfully");
+        } catch (Throwable t) {
+            log(t);
+        }
     }
 
-    private void syncAsync(final ContentResolver resolver, final String uriString, final String source) {
-        if (uriString == null || !uriString.startsWith(PICTORIAL_URI_PREFIX)) {
+    private void syncAsync(final ContentResolver resolver, final String pathOrUri, final String source) {
+        if (pathOrUri == null || pathOrUri.equals(lastSynced.get())) {
             return;
         }
-        if (uriString.equals(lastSynced.get())) {
-            return;
-        }
-        lastSynced.set(uriString);
+        lastSynced.set(pathOrUri);
 
         executor.execute(new Runnable() {
             @Override
@@ -212,11 +226,45 @@ public final class MainHook implements IXposedHookLoadPackage {
                         log("skip sync: no context source=" + source);
                         return;
                     }
-                    InputStream in = resolver.openInputStream(Uri.parse(uriString));
+
+                    InputStream in = null;
+                    if (pathOrUri.startsWith("content://")) {
+                        in = resolver.openInputStream(Uri.parse(pathOrUri));
+                    } else if (pathOrUri.startsWith("/")) {
+                        File file = new File(pathOrUri);
+                        if (file.exists() && file.isFile()) {
+                            in = new FileInputStream(file);
+                        }
+                    } else {
+                        // 缓存模糊搜索
+                        String[] possibleDirs = {
+                                "/data/user/0/com.heytap.pictorial/files/wallpaper",
+                                "/data/user/0/com.heytap.pictorial/app_wallpaper"
+                        };
+                        for (String dirPath : possibleDirs) {
+                            File dir = new File(dirPath);
+                            if (dir.exists() && dir.isDirectory()) {
+                                File[] files = dir.listFiles();
+                                if (files != null) {
+                                    for (File f : files) {
+                                        if (f.getName().startsWith(pathOrUri)) {
+                                            in = new FileInputStream(f);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (in != null) {
+                                break;
+                            }
+                        }
+                    }
+
                     if (in == null) {
-                        log("skip sync: openInputStream returned null uri=" + uriString);
+                        log("skip sync: cannot open stream for path=" + pathOrUri + " source=" + source);
                         return;
                     }
+
                     try {
                         int id = WallpaperManager.getInstance(context).setStream(
                                 in,
@@ -224,7 +272,7 @@ public final class MainHook implements IXposedHookLoadPackage {
                                 true,
                                 WallpaperManager.FLAG_SYSTEM
                         );
-                        log("synced id=" + id + " source=" + source + " uri=" + uriString);
+                        log("synced id=" + id + " source=" + source + " path=" + pathOrUri);
                     } finally {
                         in.close();
                     }
@@ -237,7 +285,7 @@ public final class MainHook implements IXposedHookLoadPackage {
 
     private static Context getContextFromResolver(ContentResolver resolver) {
         try {
-            java.lang.reflect.Field field = ContentResolver.class.getDeclaredField("mContext");
+            Field field = ContentResolver.class.getDeclaredField("mContext");
             field.setAccessible(true);
             Object context = field.get(resolver);
             return context instanceof Context ? (Context) context : null;
